@@ -57,7 +57,7 @@ jobs:
     outputs:
       platform: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.platform }}
       eclwatch: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.eclwatch }}
-
+      workflows: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.workflows }}
     steps:
       - id: skip_check
         uses: hpcc-systems/github-actions/changed-modules@main
@@ -67,7 +67,7 @@ jobs:
   build-and-setup:
     name: Build platform and regress setup
     needs: check-skip
-    if: ${{ needs.check-skip.outputs.platform || needs.check-skip.outputs.eclwatch }}
+    if: ${{ needs.check-skip.outputs.platform || needs.check-skip.outputs.eclwatch || needs.check-skip.outputs.workflows }}
     runs-on: ubuntu-22.04
     timeout-minutes: 150 # the build step has its own timeout, however the job can sometimes take time to download dependencies
     outputs:
@@ -299,6 +299,8 @@ jobs:
           build/CMakeCache.txt
           build/CMakeFiles/CMakeOutput.log
           build/CMakeFiles/CMakeError.log
+          install/opt/HPCCSystems/testing/regress/trace_files.zip
+
 
     # Cache contains:
     # - make binaries (build-cache)
@@ -337,6 +339,11 @@ jobs:
         rm -rf copy/install/var/lib/HPCCSystems/hpcc-data
         rm -rf copy/install/var/lib/HPCCSystems/queries
 
+    - name: Enable core dumps
+      run: |
+        ulimit -c 100
+        echo 'core_%e.%p' | sudo tee /proc/sys/kernel/core_pattern
+
     - name: Run regression suite setup
       if: ${{ steps.check-cache.outputs.state != '' && github.event_name == 'pull_request' }}
       timeout-minutes: 10
@@ -351,9 +358,20 @@ jobs:
         timeoutcmd $((8 * 60)) \
           ./ecl-test setup --preAbort 'smoketest-preabort.sh' --pq 2 --generateStackTrace
         grep Failure: ${{ github.workspace }}/regress/log/setup_*.log
-        if [[ "$(grep -ohP '(?<=^Failure: )[0-9]+$' ${{ github.workspace }}/regress/log/setup_*.log | awk '{s+=$1} END {print s}')" -gt 0 ]]; then exit 1; fi
         ${{ github.workspace }}/install/opt/HPCCSystems/etc/init.d/hpcc-init stop
-
+        # Copy and run CoreScript to check for core files and generate trace files
+        cp -v ${{ github.workspace }}/src/.github/workflows/CoreScript.sh .
+        chmod +x CoreScript.sh
+        ./CoreScript.sh
+        if [[ "$(grep -ohP '(?<=^Failure: )[0-9]+$' ${{ github.workspace }}/regress/log/setup_*.log | awk '{s+=$1} END {print s}')" -gt 0 ]]; then exit 1; fi
+        
+    - name: Upload trace files artifact
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@v2
+      with:
+        name: trace_files
+        path: install/opt/HPCCSystems/testing/regress/trace_files.zip
+      
     - name: regression-setup-logs-artifact
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@v2
@@ -392,7 +410,7 @@ jobs:
   # TODO: needs to process results, capture report, to be assembled by workflow when all jobs done
   regression-jobs:
     needs: build-and-setup
-    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && needs.check-skip.outputs.platform }}
+    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && ( needs.check-skip.outputs.platform || needs.check-skip.outputs.workflows ) }}
     timeout-minutes: 60 # each matrix step has its own timeout, however the job can sometimes take time to download dependencies
     runs-on: ubuntu-22.04
     strategy:
@@ -512,7 +530,7 @@ jobs:
   # but as this is relatively quick and in parallel with others, it probably doesn't matter
   eclwatch-ui-tests:
     needs: build-and-setup
-    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && needs.check-skip.outputs.eclwatch }}
+    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && ( needs.check-skip.outputs.eclwatch || needs.check-skip.outputs.workflows ) }}
     timeout-minutes: 30 # the ui-tests run step has its own timeout, however the job can sometimes take time to download dependencies
     runs-on: ubuntu-22.04
     steps:
