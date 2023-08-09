@@ -51,13 +51,13 @@ on:
 # does not have permission to cancel actions.
 jobs:
   check-skip:
-    # continue-on-error: true # Uncomment once integration is finished
+    continue-on-error: true # Uncomment once integration is finished, removed comment to check github actions
     runs-on: ubuntu-22.04
     # Map a step output to a job output
     outputs:
       platform: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.platform }}
       eclwatch: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.eclwatch }}
-
+      workflows: ${{ contains(github.event.pull_request.labels.*.name, 'smoketest-force-rerun') || steps.skip_check.outputs.workflows }}
     steps:
       - id: skip_check
         uses: hpcc-systems/github-actions/changed-modules@main
@@ -67,7 +67,7 @@ jobs:
   build-and-setup:
     name: Build platform and regress setup
     needs: check-skip
-    if: ${{ needs.check-skip.outputs.platform || needs.check-skip.outputs.eclwatch }}
+    if: ${{ needs.check-skip.outputs.platform || needs.check-skip.outputs.eclwatch || needs.check-skip.outputs.workflows }}f
     runs-on: ubuntu-22.04
     timeout-minutes: 150 # the build step has its own timeout, however the job can sometimes take time to download dependencies
     outputs:
@@ -332,6 +332,8 @@ jobs:
         xmlstarlet ed -L -u 'Environment/Software/ThorCluster/@slavesPerNode' -v 2 -u 'Environment/Software/ThorCluster/@channelsPerSlave' -v 1 install/etc/HPCCSystems/environment.xml
         cp ${{ github.workspace }}/src/.github/workflows/timeoutcmd install/opt/HPCCSystems/bin/
         cp ${{ github.workspace }}/src/.github/workflows/smoketest-preabort.sh install/opt/HPCCSystems/bin/
+        cp ${{ github.workspace }}/src/.github/workflows/CoreScript.sh install/opt/HPCCSystems/bin/
+        cp ${{ github.workspace }}/src/.github/workflows/MatrixCoreScript.sh install/opt/HPCCSystems/bin/
         mkdir copy
         cp -rp install copy/
         rm -rf copy/install/var/lib/HPCCSystems/hpcc-data
@@ -392,7 +394,7 @@ jobs:
   # TODO: needs to process results, capture report, to be assembled by workflow when all jobs done
   regression-jobs:
     needs: build-and-setup
-    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && needs.check-skip.outputs.platform }}
+    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && ( needs.check-skip.outputs.platform || needs.check-skip.outputs.workflows ) }}
     timeout-minutes: 60 # each matrix step has its own timeout, however the job can sometimes take time to download dependencies
     runs-on: ubuntu-22.04
     strategy:
@@ -438,6 +440,11 @@ jobs:
         sudo apt-get install -y nodejs
 
         echo "node.js version = $(node --version), npm version = $(npm --version), release = $(lsb_release -sc)"
+        
+    - name: Enable core dumps
+      run: |
+        ulimit -c 100
+        echo 'core_%e.%p' | sudo tee /proc/sys/kernel/core_pattern
 
     - name: run
       timeout-minutes: 30 # generous, each matrix step shouldn't take more than 10 mins
@@ -447,7 +454,9 @@ jobs:
         tar --zstd -xf install.tgz
         source install/opt/HPCCSystems/sbin/hpcc_setenv
         install/opt/HPCCSystems/etc/init.d/hpcc-init start
+        cp -v install/opt/HPCCSystems/bin/MatrixCoreScript.sh install/opt/HPCCSystems/testing/regress
         cd install/opt/HPCCSystems/testing/regress
+        chmod +x MatrixCoreScript.sh
 
         (cd ecl; ls ${{ matrix.match.pattern }}) > matches.tmp
         echo queries are:
@@ -461,9 +470,11 @@ jobs:
         echo queries after exclude: ${queries}
 
         # force regression suite to timeout after 28 minutes, so it captures ZAP report of any inflight hung queries
+        # Changed --pq 2 to -- pq 3 to see if it can be more efficient
         timeoutcmd $((28 * 60)) \
-          ./ecl-test query --preAbort 'smoketest-preabort.sh' --pq 2 --target ${{ matrix.engine }} --excludeclass python2,embedded-r,embedded-js,3rdpartyservice,mongodb --generateStackTrace ${queries}
+          ./ecl-test query --preAbort 'smoketest-preabort.sh' --pq 3 --target ${{ matrix.engine }} --excludeclass python2,embedded-r,embedded-js,3rdpartyservice,mongodb --generateStackTrace ${queries}
         grep Failure: ${{ github.workspace }}/regress/log/${{ matrix.engine }}.*.log
+        ENGINE=${{ matrix.engine }} PATTERN=${{ matrix.match.pattern }} ./MatrixCoreScript.sh
         if [[ "$(grep -oP '(?<=^Failure: )[0-9]+$' ${{ github.workspace }}/regress/log/${{ matrix.engine }}.*.log)" -gt 0 ]]; then exit 1; fi
 
     - name: regression-run-logs-artifact
@@ -475,6 +486,14 @@ jobs:
           install/var/log/HPCCSystems
           regress/
         if-no-files-found: error
+    
+    - name: Upload trace files
+      uses: actions/upload-artifact@v2
+      if: always() # This makes sure the step is executed even if previous steps fail
+      with:
+        name: trace-files-${{ matrix.engine }}-${{ steps.vars.outputs.matrix-setname }}
+        path: MatrixTrace.zip
+        if-no-files-found: ignore # If no files are found, don't mark the workflow as failed
 
 
   # NB: this doesn't really need the post-setup data files included in install.tgz
@@ -512,7 +531,7 @@ jobs:
   # but as this is relatively quick and in parallel with others, it probably doesn't matter
   eclwatch-ui-tests:
     needs: build-and-setup
-    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && needs.check-skip.outputs.eclwatch }}
+    if: ${{ needs.build-and-setup.outputs.cache-state != '' && github.event_name == 'pull_request' && ( needs.check-skip.outputs.eclwatch || needs.check-skip.outputs.workflows ) }}
     timeout-minutes: 30 # the ui-tests run step has its own timeout, however the job can sometimes take time to download dependencies
     runs-on: ubuntu-22.04
     steps:
